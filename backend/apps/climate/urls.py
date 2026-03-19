@@ -1,0 +1,48 @@
+from django.urls import path
+
+from .views import (
+    DashboardOverviewView,
+    DashboardTimeseriesView,
+    LocationDetailView,
+    LocationsView,
+    NdviMonthlyView,
+    NdviRangeView,
+    NdviYearlyView,
+    RainfallCompareLocationsView,
+    RainfallComparePeriodsView,
+    RainfallMonthlyView,
+    RainfallRangeView,
+    RainfallYearlyView,
+    SoilMoistureMonthlyView,
+    SoilMoistureRangeView,
+    TemperatureMonthlyView,
+    TemperatureRangeView,
+    TvdiDroughtSummaryView,
+    TvdiMonthlyView,
+    TvdiRangeView,
+    TvdiSevereEventsView,
+)
+
+
+urlpatterns = [
+    path("locations", LocationsView.as_view()),
+    path("locations/<int:location_id>", LocationDetailView.as_view()),
+    path("rainfall", RainfallRangeView.as_view()),
+    path("rainfall/monthly", RainfallMonthlyView.as_view()),
+    path("rainfall/yearly", RainfallYearlyView.as_view()),
+    path("rainfall/compare-periods", RainfallComparePeriodsView.as_view()),
+    path("rainfall/compare-locations", RainfallCompareLocationsView.as_view()),
+    path("temperature", TemperatureRangeView.as_view()),
+    path("temperature/monthly", TemperatureMonthlyView.as_view()),
+    path("soil-moisture", SoilMoistureRangeView.as_view()),
+    path("soil-moisture/monthly", SoilMoistureMonthlyView.as_view()),
+    path("ndvi", NdviRangeView.as_view()),
+    path("ndvi/monthly", NdviMonthlyView.as_view()),
+    path("ndvi/yearly", NdviYearlyView.as_view()),
+    path("tvdi", TvdiRangeView.as_view()),
+    path("tvdi/monthly", TvdiMonthlyView.as_view()),
+    path("tvdi/drought-summary", TvdiDroughtSummaryView.as_view()),
+    path("tvdi/severe-events", TvdiSevereEventsView.as_view()),
+    path("dashboard/overview", DashboardOverviewView.as_view()),
+    path("dashboard/timeseries", DashboardTimeseriesView.as_view()),
+]
