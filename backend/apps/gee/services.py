@@ -25,15 +25,32 @@ def fetch_data(payload: dict):
 
 
 def validate_fetch_payload(payload: dict):
-    required = ["province", "location_id", "start_date", "end_date"]
+    has_geometry = isinstance(payload.get("geometry"), dict)
+    has_province_mode = bool(payload.get("province"))
+
+    required = ["start_date", "end_date"]
     missing = [field for field in required if not payload.get(field)]
     if missing:
         return False, {"error": "Missing required fields", "required": required}
 
-    try:
-        payload["location_id"] = int(payload["location_id"])
-    except (TypeError, ValueError):
-        return False, {"error": "location_id must be an integer"}
+    if not has_geometry and not has_province_mode:
+        return False, {
+            "error": "Provide either `province` for location-based analysis or `geometry` for custom-area analysis",
+        }
+
+    location_id = payload.get("location_id")
+    if location_id not in (None, ""):
+        try:
+            payload["location_id"] = int(location_id)
+        except (TypeError, ValueError):
+            return False, {"error": "location_id must be an integer"}
+    else:
+        payload["location_id"] = None
+
+    if has_geometry:
+        geometry_type = payload["geometry"].get("type")
+        if geometry_type not in {"Feature", "FeatureCollection", "Polygon", "MultiPolygon"}:
+            return False, {"error": "Invalid geometry payload. Use GeoJSON Feature, FeatureCollection, Polygon or MultiPolygon."}
 
     data_types = payload.get("data_types")
     if not isinstance(data_types, list) or not data_types:

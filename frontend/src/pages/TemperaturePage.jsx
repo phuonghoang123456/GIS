@@ -2,10 +2,13 @@ import { useEffect, useMemo, useState } from "react";
 import { Bar, Line } from "react-chartjs-2";
 
 import "../components/chartSetup";
-import { apiClient } from "../api/client";
+import { apiClient, authHeaders } from "../api/client";
 import StatCard from "../components/StatCard";
 import SyncProgressModal from "../components/SyncProgressModal";
 import { useAuth } from "../context/AuthContext";
+import { buildLocationAnalysisScope, readSelectedAnalysisScope, writeSelectedAnalysisScope } from "../utils/analysisScope";
+import { buildTemperatureMonthly, readGeometryScope } from "../utils/geometryAnalysis";
+import { pickPreferredLocation, writeSelectedLocation } from "../utils/locationSelection";
 import { toVietnameseLabel } from "../utils/viText";
 
 const DEFAULT_LOCATION = { id: 1, name: "Quảng Trị", province: "Quảng Trị" };
@@ -28,7 +31,8 @@ function classifyTemperature(value) {
 }
 
 export default function TemperaturePage() {
-  const { logActivity } = useAuth();
+  const { logActivity, token } = useAuth();
+  const [geometryScope, setGeometryScope] = useState(() => readGeometryScope());
   const [locations, setLocations] = useState([]);
   const [form, setForm] = useState({
     locationId: "1",
@@ -45,6 +49,7 @@ export default function TemperaturePage() {
   const [dailyData, setDailyData] = useState([]);
   const [monthlyData, setMonthlyData] = useState([]);
   const locationOptions = locations.length > 0 ? locations : [DEFAULT_LOCATION];
+  const usingGeometry = Boolean(geometryScope?.geometry);
 
   useEffect(() => {
     void logActivity("page_view", "temperature");
@@ -57,10 +62,14 @@ export default function TemperaturePage() {
         const next = locResponse.data?.data || [];
         if (next.length > 0) {
           setLocations(next);
+          const preferred = pickPreferredLocation(next, DEFAULT_LOCATION);
+          writeSelectedLocation(preferred);
+          const scope = readSelectedAnalysisScope();
+          setGeometryScope(scope?.mode === "geometry" && scope.geometry ? scope : null);
           setForm((prev) => ({
             ...prev,
-            locationId: String(next[0].id),
-            province: toVietnameseLabel(next[0].province)
+            locationId: String(scope?.locationId || preferred.id),
+            province: toVietnameseLabel(scope?.province || preferred.province)
           }));
         } else {
           setLocations([DEFAULT_LOCATION]);
@@ -101,10 +110,68 @@ export default function TemperaturePage() {
     return () => window.clearInterval(timer);
   }, []);
 
+  const hydrateCustomLocation = (locationId, name, province) => {
+    if (!locationId) {
+      return;
+    }
+    setLocations((current) => {
+      if (current.some((item) => Number(item.id) === Number(locationId))) {
+        return current;
+      }
+      return [{ id: Number(locationId), name, province }, ...current];
+    });
+  };
+
+  const loadDatabaseResults = async (locationId, province) => {
+    const year = form.startDate.split("-")[0];
+    const [daily, monthly] = await Promise.all([
+      apiClient.get("/temperature", {
+        params: { location_id: locationId, start: form.startDate, end: form.endDate, source: "db", province }
+      }),
+      apiClient.get("/temperature/monthly", {
+        params: { location_id: locationId, year, source: "db", province }
+      })
+    ]);
+    setDailyData(daily.data?.data?.data || []);
+    setStats(daily.data?.data?.statistics || null);
+    setMonthlyData(monthly.data?.data?.monthly_data || []);
+  };
+
   const loadData = async (source = "gee") => {
     setLoading(true);
     setStatus("");
     try {
+      if (usingGeometry) {
+        const response = await apiClient.post(
+          "/temperature",
+          {
+            geometry: geometryScope.geometry,
+            area_name: geometryScope.name,
+            province: geometryScope.province,
+            source_type: geometryScope.sourceType,
+            boundary_code: geometryScope.boundaryCode,
+            history_id: geometryScope.historyId,
+            location_id: geometryScope.locationId,
+            start_date: form.startDate,
+            end_date: form.endDate
+          },
+          { headers: authHeaders(token) }
+        );
+        const payload = response.data?.data || {};
+        const rows = payload.data || [];
+        setDailyData(rows);
+        setStats(payload.statistics || null);
+        setMonthlyData(buildTemperatureMonthly(rows));
+        if (payload.analysis_scope?.history_id) {
+          const nextScope = { ...geometryScope, historyId: payload.analysis_scope.history_id };
+          setGeometryScope(nextScope);
+          writeSelectedAnalysisScope(nextScope);
+        }
+        setStatus("Đã cập nhật kết quả nhiệt độ theo vùng geometry tùy chọn.");
+        setStatusType("ok");
+        return;
+      }
+
       const year = form.startDate.split("-")[0];
       const [daily, monthly] = await Promise.all([
         apiClient.get("/temperature", {
@@ -138,17 +205,46 @@ export default function TemperaturePage() {
     setSyncing(true);
     setStatus("");
     try {
-      const response = await apiClient.post("/gee/fetch", {
-        province: form.province,
-        location_id: Number(form.locationId),
-        start_date: form.startDate,
-        end_date: form.endDate,
-        data_types: ["temperature"]
-      });
+      const response = await apiClient.post(
+        "/gee/fetch",
+        usingGeometry
+          ? {
+              geometry: geometryScope.geometry,
+              area_name: geometryScope.name,
+              province: geometryScope.province,
+              source_type: geometryScope.sourceType,
+              boundary_code: geometryScope.boundaryCode,
+              history_id: geometryScope.historyId,
+              location_id: geometryScope.locationId,
+              start_date: form.startDate,
+              end_date: form.endDate,
+              data_types: ["temperature"]
+            }
+          : {
+              province: form.province,
+              location_id: Number(form.locationId),
+              start_date: form.startDate,
+              end_date: form.endDate,
+              data_types: ["temperature"]
+            },
+        { headers: authHeaders(token) }
+      );
       const records = response.data?.data?.results?.temperature?.records || 0;
       setStatus(`Đồng bộ thành công ${records} bản ghi nhiệt độ.`);
       setStatusType("ok");
-      await loadData("db");
+      if (usingGeometry) {
+        const nextLocationId = Number(response.data?.data?.location_id || 0);
+        if (nextLocationId) {
+          hydrateCustomLocation(nextLocationId, geometryScope.name, geometryScope.province);
+          setForm((prev) => ({ ...prev, locationId: String(nextLocationId), province: geometryScope.province }));
+          const nextScope = { ...geometryScope, locationId: nextLocationId, historyId: response.data?.data?.history_id || geometryScope.historyId };
+          setGeometryScope(nextScope);
+          writeSelectedAnalysisScope(nextScope);
+          await loadDatabaseResults(nextLocationId, geometryScope.province);
+        }
+      } else {
+        await loadData("db");
+      }
     } catch (err) {
       setStatus(err.response?.data?.error?.message || "Đồng bộ GEE thất bại.");
       setStatusType("error");
@@ -234,6 +330,11 @@ export default function TemperaturePage() {
       <div className={`status ${geeOnline ? "ok" : "warn"}`}>
         GEE Service: {geeOnline ? "Online" : "Offline"}
       </div>
+      {usingGeometry ? (
+        <div className="status ok">
+          Đang phân tích theo vùng tùy chọn: <strong>{toVietnameseLabel(geometryScope.name)}</strong>. Dữ liệu được lấy trực tiếp từ GEE theo geometry đã chọn trên bản đồ.
+        </div>
+      ) : null}
 
       <section className="card controls">
         <div className="field">
@@ -247,6 +348,11 @@ export default function TemperaturePage() {
                 locationId: e.target.value,
                 province: toVietnameseLabel(loc?.province || prev.province)
               }));
+              if (loc) {
+                setGeometryScope(null);
+                writeSelectedLocation(loc);
+                writeSelectedAnalysisScope(buildLocationAnalysisScope(loc));
+              }
             }}
           >
             {locationOptions.map((location) => (

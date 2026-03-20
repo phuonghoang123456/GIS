@@ -92,6 +92,26 @@ PROVINCE_MAPPING = {
     # Thêm các tỉnh khác nếu cần
 }
 
+
+def geometry_payload_to_ee_geometry(geometry_payload):
+    if not isinstance(geometry_payload, dict):
+        return None
+
+    geometry_type = geometry_payload.get("type")
+    try:
+        if geometry_type == "FeatureCollection":
+            return ee.FeatureCollection(geometry_payload).geometry()
+        if geometry_type == "Feature":
+            geometry = geometry_payload.get("geometry")
+            return ee.Geometry(geometry) if geometry else None
+        if geometry_type in {"Polygon", "MultiPolygon"}:
+            return ee.Geometry(geometry_payload)
+    except Exception as e:
+        print(f"Failed to convert GeoJSON to ee.Geometry: {e}")
+        return None
+    return None
+
+
 # Get region geometry
 def get_region_geometry(province_name):
     try:
@@ -886,6 +906,97 @@ def ensure_location_exists(location_id, province_name):
             conn.close()
 
 
+def ensure_custom_location(location_id, area_name, province_name, geometry_payload):
+    conn = None
+    cur = None
+    geometry_json = json.dumps(geometry_payload, ensure_ascii=False) if geometry_payload else None
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        conn.autocommit = False
+        cur = conn.cursor()
+
+        if location_id:
+            cur.execute("SELECT id FROM locations WHERE id = %s", (location_id,))
+            existing = cur.fetchone()
+            if existing:
+                cur.execute(
+                    """
+                    UPDATE locations
+                    SET name = %s,
+                        province = %s,
+                        geometry = %s::jsonb
+                    WHERE id = %s
+                    """,
+                    (area_name, province_name, geometry_json, location_id),
+                )
+                conn.commit()
+                print(f"[DB] Updated custom location id={location_id} name={area_name}")
+                return int(location_id)
+
+        if geometry_json:
+            cur.execute(
+                """
+                SELECT id
+                FROM locations
+                WHERE LOWER(name) = LOWER(%s)
+                  AND LOWER(province) = LOWER(%s)
+                  AND geometry = %s::jsonb
+                ORDER BY id
+                LIMIT 1
+                """,
+                (area_name, province_name, geometry_json),
+            )
+            matched = cur.fetchone()
+            if matched:
+                conn.commit()
+                print(f"[DB] Reusing custom location id={matched[0]} name={area_name}")
+                return int(matched[0])
+
+        if location_id:
+            cur.execute(
+                """
+                INSERT INTO locations (id, name, province, geometry)
+                VALUES (%s, %s, %s, %s::jsonb)
+                RETURNING id
+                """,
+                (location_id, area_name, province_name, geometry_json),
+            )
+            created_id = cur.fetchone()[0]
+            cur.execute(
+                """
+                SELECT setval(
+                    pg_get_serial_sequence('locations', 'id'),
+                    COALESCE((SELECT MAX(id) FROM locations), 1),
+                    true
+                )
+                """
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO locations (name, province, geometry)
+                VALUES (%s, %s, %s::jsonb)
+                RETURNING id
+                """,
+                (area_name, province_name, geometry_json),
+            )
+            created_id = cur.fetchone()[0]
+
+        conn.commit()
+        print(f"[DB] Created custom location id={created_id} name={area_name}")
+        return int(created_id)
+    except Exception as e:
+        if conn is not None:
+            conn.rollback()
+        print(f"[DB] Failed to ensure custom location {area_name}: {e}")
+        return None
+    finally:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.close()
+
+
 def build_result_payload(df, table_name, persist, include_data):
     if persist:
         save_summary = save_to_database(df, table_name)
@@ -921,17 +1032,24 @@ def dataframe_to_records(df):
 @app.route('/fetch-data', methods=['POST'])
 def fetch_data():
     try:
-        data = request.json
+        data = request.json or {}
         province = data.get('province')
+        area_name = data.get('area_name') or province or 'Vung tuy chon'
         location_id = data.get('location_id')
+        geometry_payload = data.get('geometry')
         start_date = data.get('start_date')
         end_date = data.get('end_date')
         data_types = data.get('data_types', [])
         persist = bool(data.get('persist', True))
         include_data = bool(data.get('include_data', False))
-        
-        if not all([province, location_id, start_date, end_date]):
+
+        if not all([start_date, end_date]):
             return jsonify({'error': 'Missing required parameters'}), 400
+
+        try:
+            location_id = int(location_id) if location_id not in (None, "") else None
+        except (TypeError, ValueError):
+            return jsonify({'error': 'location_id must be an integer'}), 400
         
         # Initialize GEE
         if not initialize_gee():
@@ -942,42 +1060,62 @@ def fetch_data():
                     'project': GEE_STATE.get("project"),
                 }
             ), 500
-        
-        # Get geometry
-        geometry = get_region_geometry(province)
-        if geometry is None:
-            return jsonify({'error': f'Province not found: {province}'}), 404
 
-        if persist and not ensure_location_exists(location_id, province):
-            return jsonify({'error': f'Failed to prepare location {location_id} for province {province}'}), 500
+        analysis_mode = 'geometry' if geometry_payload else 'province'
+        province_label = province or area_name
+
+        if geometry_payload:
+            geometry = geometry_payload_to_ee_geometry(geometry_payload)
+            if geometry is None:
+                return jsonify({'error': 'Invalid geometry payload'}), 400
+        else:
+            if not province:
+                return jsonify({'error': 'Missing province for location-based analysis'}), 400
+            geometry = get_region_geometry(province)
+            if geometry is None:
+                return jsonify({'error': f'Province not found: {province}'}), 404
+
+        effective_location_id = location_id or 0
+        if persist:
+            if geometry_payload:
+                prepared_location_id = ensure_custom_location(location_id, area_name, province_label, geometry_payload)
+                if not prepared_location_id:
+                    return jsonify({'error': f'Failed to prepare custom area location {area_name}'}), 500
+                effective_location_id = prepared_location_id
+            else:
+                if not ensure_location_exists(location_id, province_label):
+                    return jsonify({'error': f'Failed to prepare location {location_id} for province {province_label}'}), 500
+                effective_location_id = int(location_id)
         
         results = {}
         
         # Fetch data based on selected types
         if 'rainfall' in data_types:
-            df = get_rainfall_data(geometry, start_date, end_date, location_id)
+            df = get_rainfall_data(geometry, start_date, end_date, effective_location_id)
             results['rainfall'] = build_result_payload(df, 'rainfall_data', persist, include_data)
         
         if 'temperature' in data_types:
-            df = get_temperature_data(geometry, start_date, end_date, location_id)
+            df = get_temperature_data(geometry, start_date, end_date, effective_location_id)
             results['temperature'] = build_result_payload(df, 'temperature_data', persist, include_data)
         
         if 'soil_moisture' in data_types:
-            df = get_soil_moisture_data(geometry, start_date, end_date, location_id)
+            df = get_soil_moisture_data(geometry, start_date, end_date, effective_location_id)
             results['soil_moisture'] = build_result_payload(df, 'soil_moisture_data', persist, include_data)
         
         if 'ndvi' in data_types:
-            df = get_ndvi_data(geometry, start_date, end_date, location_id)
+            df = get_ndvi_data(geometry, start_date, end_date, effective_location_id)
             results['ndvi'] = build_result_payload(df, 'ndvi_data', persist, include_data)
         
         if 'tvdi' in data_types:
-            df = get_tvdi_data(geometry, start_date, end_date, location_id)
+            df = get_tvdi_data(geometry, start_date, end_date, effective_location_id)
             results['tvdi'] = build_result_payload(df, 'tvdi_data', persist, include_data)
         
         return jsonify({
             'success': True,
-            'province': province,
-            'location_id': location_id,
+            'province': province_label,
+            'area_name': area_name,
+            'location_id': effective_location_id,
+            'analysis_mode': analysis_mode,
             'period': f'{start_date} to {end_date}',
             'results': results
         })

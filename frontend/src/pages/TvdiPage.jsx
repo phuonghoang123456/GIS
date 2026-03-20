@@ -2,13 +2,23 @@ import { useEffect, useMemo, useState } from "react";
 import { Bar, Doughnut, Line } from "react-chartjs-2";
 
 import "../components/chartSetup";
-import { apiClient } from "../api/client";
+import { apiClient, authHeaders } from "../api/client";
 import StatCard from "../components/StatCard";
 import SyncProgressModal from "../components/SyncProgressModal";
 import { useAuth } from "../context/AuthContext";
+import { buildLocationAnalysisScope, readSelectedAnalysisScope, writeSelectedAnalysisScope } from "../utils/analysisScope";
+import {
+  buildTvdiDroughtSummary,
+  buildTvdiMonthly,
+  buildTvdiSevereEvents,
+  finalizeTvdiDroughtSummary,
+  readGeometryScope,
+} from "../utils/geometryAnalysis";
+import { pickPreferredLocation, writeSelectedLocation } from "../utils/locationSelection";
 import { toVietnameseLabel } from "../utils/viText";
 
 const DEFAULT_LOCATION = { id: 1, name: "Quảng Trị", province: "Quảng Trị" };
+const droughtColors = ["#2166ac", "#67a9cf", "#fddbc7", "#ef8a62", "#b2182b"];
 
 function classifyTvdi(value) {
   const v = Number(value);
@@ -27,10 +37,19 @@ function classifyTvdi(value) {
   return { level: "Hạn cực đoan", desc: "Tình huống khẩn cấp, cần kích hoạt phương án ứng phó." };
 }
 
-const droughtColors = ["#2166ac", "#67a9cf", "#fddbc7", "#ef8a62", "#b2182b"];
+function classificationChip(type) {
+  if (type === "extreme") {
+    return "chip danger";
+  }
+  if (type === "severe") {
+    return "chip warn";
+  }
+  return "chip";
+}
 
 export default function TvdiPage() {
-  const { logActivity } = useAuth();
+  const { logActivity, token } = useAuth();
+  const [geometryScope, setGeometryScope] = useState(() => readGeometryScope());
   const [locations, setLocations] = useState([]);
   const [form, setForm] = useState({
     locationId: "1",
@@ -46,7 +65,10 @@ export default function TvdiPage() {
   const [stats, setStats] = useState(null);
   const [dailyData, setDailyData] = useState([]);
   const [monthlyData, setMonthlyData] = useState([]);
+  const [droughtSummary, setDroughtSummary] = useState({});
+  const [severeEvents, setSevereEvents] = useState([]);
   const locationOptions = locations.length > 0 ? locations : [DEFAULT_LOCATION];
+  const usingGeometry = Boolean(geometryScope?.geometry);
 
   useEffect(() => {
     void logActivity("page_view", "tvdi");
@@ -59,36 +81,27 @@ export default function TvdiPage() {
         const next = response.data?.data || [];
         if (next.length > 0) {
           setLocations(next);
+          const preferred = pickPreferredLocation(next, DEFAULT_LOCATION);
+          writeSelectedLocation(preferred);
+          const scope = readSelectedAnalysisScope();
+          setGeometryScope(scope?.mode === "geometry" && scope.geometry ? scope : null);
           setForm((prev) => ({
             ...prev,
-            locationId: String(next[0].id),
-            province: toVietnameseLabel(next[0].province)
+            locationId: String(scope?.locationId || preferred.id),
+            province: toVietnameseLabel(scope?.province || preferred.province)
           }));
         } else {
           setLocations([DEFAULT_LOCATION]);
-          setForm((prev) => ({
-            ...prev,
-            locationId: String(DEFAULT_LOCATION.id),
-            province: DEFAULT_LOCATION.province
-          }));
           setStatus("Chưa có dữ liệu địa điểm trong CSDL, đang dùng địa điểm mặc định Quảng Trị.");
           setStatusType("warn");
         }
       } catch {
         setLocations([DEFAULT_LOCATION]);
-        setForm((prev) => ({
-          ...prev,
-          locationId: String(DEFAULT_LOCATION.id),
-          province: DEFAULT_LOCATION.province
-        }));
         setStatus("Không tải được danh sách địa điểm.");
         setStatusType("warn");
       }
     };
-    void boot();
-  }, []);
 
-  useEffect(() => {
     const check = async () => {
       try {
         const response = await apiClient.get("/gee/status");
@@ -98,15 +111,97 @@ export default function TvdiPage() {
         setGeeOnline(false);
       }
     };
+
+    void boot();
     void check();
     const timer = window.setInterval(() => void check(), 30000);
     return () => window.clearInterval(timer);
   }, []);
 
+  const loadAdvancedData = async () => {
+    try {
+      const startYear = form.startDate.slice(0, 4);
+      const endYear = form.endDate.slice(0, 4);
+      const [summaryResponse, severeResponse] = await Promise.all([
+        apiClient.get("/tvdi/drought-summary", {
+          params: { location_id: form.locationId, start_year: startYear, end_year: endYear }
+        }),
+        apiClient.get("/tvdi/severe-events", {
+          params: { location_id: form.locationId, start: form.startDate, end: form.endDate }
+        })
+      ]);
+      setDroughtSummary(summaryResponse.data?.data?.drought_summary || {});
+      setSevereEvents(severeResponse.data?.data?.severe_events || []);
+    } catch {
+      setDroughtSummary({});
+      setSevereEvents([]);
+    }
+  };
+
+  const hydrateCustomLocation = (locationId, name, province) => {
+    if (!locationId) {
+      return;
+    }
+    setLocations((current) => {
+      if (current.some((item) => Number(item.id) === Number(locationId))) {
+        return current;
+      }
+      return [{ id: Number(locationId), name, province }, ...current];
+    });
+  };
+
+  const loadDatabaseResults = async (locationId, province) => {
+    const year = form.startDate.split("-")[0];
+    const [daily, monthly] = await Promise.all([
+      apiClient.get("/tvdi", {
+        params: { location_id: locationId, start: form.startDate, end: form.endDate, source: "db", province }
+      }),
+      apiClient.get("/tvdi/monthly", {
+        params: { location_id: locationId, year, source: "db", province }
+      })
+    ]);
+    setDailyData(daily.data?.data?.data || []);
+    setStats(daily.data?.data?.statistics || null);
+    setMonthlyData(monthly.data?.data?.monthly_data || []);
+  };
+
   const loadData = async (source = "gee") => {
     setLoading(true);
     setStatus("");
     try {
+      if (usingGeometry) {
+        const response = await apiClient.post(
+          "/tvdi",
+          {
+            geometry: geometryScope.geometry,
+            area_name: geometryScope.name,
+            province: geometryScope.province,
+            source_type: geometryScope.sourceType,
+            boundary_code: geometryScope.boundaryCode,
+            history_id: geometryScope.historyId,
+            location_id: geometryScope.locationId,
+            start_date: form.startDate,
+            end_date: form.endDate
+          },
+          { headers: authHeaders(token) }
+        );
+        const payload = response.data?.data || {};
+        const rows = payload.data || [];
+        setDailyData(rows);
+        setStats(payload.statistics || null);
+        setMonthlyData(buildTvdiMonthly(rows));
+        setDroughtSummary(finalizeTvdiDroughtSummary(buildTvdiDroughtSummary(rows)));
+        setSevereEvents(buildTvdiSevereEvents(rows));
+        if (payload.analysis_scope?.history_id) {
+          const nextScope = { ...geometryScope, historyId: payload.analysis_scope.history_id };
+          setGeometryScope(nextScope);
+          writeSelectedAnalysisScope(nextScope);
+        }
+        setStatus("Đã cập nhật kết quả TVDI theo vùng geometry tùy chọn.");
+        setStatusType("ok");
+        return;
+      }
+
       const year = form.startDate.split("-")[0];
       const [daily, monthly] = await Promise.all([
         apiClient.get("/tvdi", {
@@ -119,6 +214,7 @@ export default function TvdiPage() {
       setDailyData(daily.data?.data?.data || []);
       setStats(daily.data?.data?.statistics || null);
       setMonthlyData(monthly.data?.data?.monthly_data || []);
+      await loadAdvancedData();
       setStatus(source === "db" ? "Đã tải kết quả TVDI từ cơ sở dữ liệu." : "Đã cập nhật kết quả phân tích TVDI.");
       setStatusType("ok");
     } catch (err) {
@@ -139,17 +235,46 @@ export default function TvdiPage() {
     setSyncing(true);
     setStatus("");
     try {
-      const response = await apiClient.post("/gee/fetch", {
-        province: form.province,
-        location_id: Number(form.locationId),
-        start_date: form.startDate,
-        end_date: form.endDate,
-        data_types: ["tvdi"]
-      });
+      const response = await apiClient.post(
+        "/gee/fetch",
+        usingGeometry
+          ? {
+              geometry: geometryScope.geometry,
+              area_name: geometryScope.name,
+              province: geometryScope.province,
+              source_type: geometryScope.sourceType,
+              boundary_code: geometryScope.boundaryCode,
+              history_id: geometryScope.historyId,
+              location_id: geometryScope.locationId,
+              start_date: form.startDate,
+              end_date: form.endDate,
+              data_types: ["tvdi"]
+            }
+          : {
+              province: form.province,
+              location_id: Number(form.locationId),
+              start_date: form.startDate,
+              end_date: form.endDate,
+              data_types: ["tvdi"]
+            },
+        { headers: authHeaders(token) }
+      );
       const records = response.data?.data?.results?.tvdi?.records || 0;
       setStatus(`Đồng bộ thành công ${records} bản ghi TVDI.`);
       setStatusType("ok");
-      await loadData("db");
+      if (usingGeometry) {
+        const nextLocationId = Number(response.data?.data?.location_id || 0);
+        if (nextLocationId) {
+          hydrateCustomLocation(nextLocationId, geometryScope.name, geometryScope.province);
+          setForm((prev) => ({ ...prev, locationId: String(nextLocationId), province: geometryScope.province }));
+          const nextScope = { ...geometryScope, locationId: nextLocationId, historyId: response.data?.data?.history_id || geometryScope.historyId };
+          setGeometryScope(nextScope);
+          writeSelectedAnalysisScope(nextScope);
+          await loadDatabaseResults(nextLocationId, geometryScope.province);
+        }
+      } else {
+        await loadData("db");
+      }
     } catch (err) {
       setStatus(err.response?.data?.error?.message || "Đồng bộ GEE thất bại.");
       setStatusType("error");
@@ -216,22 +341,28 @@ export default function TvdiPage() {
     datasets: [{ data: classCounts, backgroundColor: droughtColors }]
   };
 
+  const droughtRows = Object.entries(droughtSummary || {});
+
   return (
-    <>
+    <div className="panel-stack">
       <SyncProgressModal
         open={syncing}
         title="Đang tải dữ liệu TVDI từ GEE"
         description="Hệ thống đang kết nối Google Earth Engine, xử lý LST, NDVI và tính toán TVDI trước khi đồng bộ."
       />
+
       <section className="card page-header">
         <h1>Phân tích TVDI</h1>
-        <p>Đánh giá tình trạng hạn hán qua TVDI, LST và tỷ lệ diện tích khô hạn.</p>
+        <p>Đánh giá tình trạng hạn hán qua TVDI, LST và các đợt khô hạn nghiêm trọng.</p>
       </section>
 
       {status && <div className={`status ${statusType}`}>{status}</div>}
-      <div className={`status ${geeOnline ? "ok" : "warn"}`}>
-        GEE Service: {geeOnline ? "Online" : "Offline"}
-      </div>
+      <div className={`status ${geeOnline ? "ok" : "warn"}`}>GEE Service: {geeOnline ? "Online" : "Offline"}</div>
+      {usingGeometry ? (
+        <div className="status ok">
+          Đang phân tích theo vùng tùy chọn: <strong>{toVietnameseLabel(geometryScope.name)}</strong>. TVDI sẽ được tính trực tiếp trên geometry đã chọn thay vì chỉ theo location trong CSDL.
+        </div>
+      ) : null}
 
       <section className="card controls">
         <div className="field">
@@ -245,6 +376,11 @@ export default function TvdiPage() {
                 locationId: e.target.value,
                 province: toVietnameseLabel(loc?.province || prev.province)
               }));
+              if (loc) {
+                setGeometryScope(null);
+                writeSelectedLocation(loc);
+                writeSelectedAnalysisScope(buildLocationAnalysisScope(loc));
+              }
             }}
           >
             {locationOptions.map((location) => (
@@ -256,25 +392,17 @@ export default function TvdiPage() {
         </div>
         <div className="field">
           <label>Từ ngày</label>
-          <input
-            type="date"
-            value={form.startDate}
-            onChange={(e) => setForm((prev) => ({ ...prev, startDate: e.target.value }))}
-          />
+          <input type="date" value={form.startDate} onChange={(e) => setForm((prev) => ({ ...prev, startDate: e.target.value }))} />
         </div>
         <div className="field">
           <label>Đến ngày</label>
-          <input
-            type="date"
-            value={form.endDate}
-            onChange={(e) => setForm((prev) => ({ ...prev, endDate: e.target.value }))}
-          />
+          <input type="date" value={form.endDate} onChange={(e) => setForm((prev) => ({ ...prev, endDate: e.target.value }))} />
         </div>
         <div className="actions">
           <button type="button" className="btn btn-secondary" onClick={fetchFromGEE} disabled={loading || !geeOnline}>
             Tải từ GEE
           </button>
-          <button type="button" className="btn btn-primary" onClick={loadData} disabled={loading || !geeOnline}>
+          <button type="button" className="btn btn-primary" onClick={() => loadData()} disabled={loading || !geeOnline}>
             {loading ? "Đang phân tích..." : "Phân tích"}
           </button>
         </div>
@@ -311,6 +439,72 @@ export default function TvdiPage() {
           <Doughnut data={classChartData} />
         </div>
       </section>
-    </>
+
+      <section className="split-grid">
+        <div className="card table-card">
+          <h3>Tổng hợp hạn hán theo năm</h3>
+          {droughtRows.length === 0 ? (
+            <p className="empty-note">Chưa có dữ liệu tổng hợp hạn hán trong cơ sở dữ liệu cho khoảng năm đã chọn.</p>
+          ) : (
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Năm</th>
+                  <th>Nhóm hạn</th>
+                  <th>Số ngày</th>
+                  <th>TVDI trung bình</th>
+                </tr>
+              </thead>
+              <tbody>
+                {droughtRows.flatMap(([year, values]) =>
+                  Object.entries(values || {}).map(([classification, payload]) => (
+                    <tr key={`${year}-${classification}`}>
+                      <td>{year}</td>
+                      <td>
+                        <span className={classificationChip(classification)}>{classification}</span>
+                      </td>
+                      <td>{payload.count}</td>
+                      <td>{payload.avg_tvdi}</td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        <div className="card table-card">
+          <h3>Đợt hạn nghiêm trọng gần nhất</h3>
+          {severeEvents.length === 0 ? (
+            <p className="empty-note">Chưa ghi nhận đợt hạn nặng hoặc cực đoan trong khoảng thời gian đã chọn.</p>
+          ) : (
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Ngày</th>
+                  <th>TVDI</th>
+                  <th>LST (°C)</th>
+                  <th>Tỷ lệ hạn (%)</th>
+                  <th>Mức</th>
+                </tr>
+              </thead>
+              <tbody>
+                {severeEvents.map((event) => (
+                  <tr key={`${event.date}-${event.classification}`}>
+                    <td>{String(event.date).slice(0, 10)}</td>
+                    <td>{event.tvdi}</td>
+                    <td>{event.lst}</td>
+                    <td>{event.drought_pct}</td>
+                    <td>
+                      <span className={classificationChip(event.classification)}>{event.classification}</span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </section>
+    </div>
   );
 }

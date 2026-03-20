@@ -4,11 +4,14 @@ import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 
 const links = [
-  { to: "/", label: "Trang chủ", end: true },
+  { to: "/", label: "Dashboard", end: true },
+  { to: "/map", label: "Bản đồ" },
   { to: "/rainfall", label: "Lượng mưa" },
   { to: "/temperature", label: "Nhiệt độ" },
+  { to: "/soil-moisture", label: "Độ ẩm đất" },
   { to: "/ndvi", label: "NDVI" },
-  { to: "/tvdi", label: "TVDI" }
+  { to: "/tvdi", label: "TVDI" },
+  { to: "/activity", label: "Hoạt động" }
 ];
 
 export default function Layout() {

@@ -1,6 +1,9 @@
 from django.urls import path
 
+from .analysis_areas import AnalysisAreaHistoryView
 from .views import (
+    AdminBoundariesView,
+    AdminBoundaryDetailView,
     DashboardOverviewView,
     DashboardTimeseriesView,
     LocationDetailView,
@@ -15,6 +18,8 @@ from .views import (
     RainfallYearlyView,
     SoilMoistureMonthlyView,
     SoilMoistureRangeView,
+    StandardProvincesView,
+    StandardWardsView,
     TemperatureMonthlyView,
     TemperatureRangeView,
     TvdiDroughtSummaryView,
@@ -25,6 +30,11 @@ from .views import (
 
 
 urlpatterns = [
+    path("analysis-areas/history", AnalysisAreaHistoryView.as_view()),
+    path("boundaries", AdminBoundariesView.as_view()),
+    path("boundaries/<int:admin_level>/<str:boundary_code>", AdminBoundaryDetailView.as_view()),
+    path("standard/provinces", StandardProvincesView.as_view()),
+    path("standard/wards", StandardWardsView.as_view()),
     path("locations", LocationsView.as_view()),
     path("locations/<int:location_id>", LocationDetailView.as_view()),
     path("rainfall", RainfallRangeView.as_view()),

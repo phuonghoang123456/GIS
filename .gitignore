@@ -6,3 +6,7 @@ __pycache__/
 *.pyc
 frontend/dist/
 backend/staticfiles/
+.codex/
+.vscode/
+docs/
+external/

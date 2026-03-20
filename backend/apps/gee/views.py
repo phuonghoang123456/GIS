@@ -2,6 +2,7 @@ from requests import RequestException
 from rest_framework.views import APIView
 
 from apps.common.responses import fail, ok
+from apps.climate.analysis_areas import record_analysis_area_usage, update_analysis_area_location
 
 from .services import check_status, fetch_data, validate_fetch_payload
 
@@ -37,12 +38,28 @@ class GeeFetchView(APIView):
 
         try:
             result = fetch_data(payload)
+            history = None
+            if payload.get("geometry") and getattr(request.user, "is_authenticated", False):
+                history = record_analysis_area_usage(
+                    request.user,
+                    payload,
+                    location_id=result.get("location_id"),
+                    extra_metadata={
+                        "mode": "gee_sync",
+                        "data_types": payload.get("data_types", []),
+                        "start_date": payload.get("start_date"),
+                        "end_date": payload.get("end_date"),
+                    },
+                )
+                update_analysis_area_location(getattr(history, "id", None), request.user.id, result.get("location_id"))
             return ok(
                 {
                     "success": True,
                     "message": "Data fetched and saved successfully",
-                    "province": payload["province"],
-                    "location_id": payload["location_id"],
+                    "province": result.get("province") or payload.get("province"),
+                    "area_name": result.get("area_name") or payload.get("area_name"),
+                    "location_id": result.get("location_id") or payload.get("location_id"),
+                    "history_id": getattr(history, "id", None),
                     "period": f'{payload["start_date"]} to {payload["end_date"]}',
                     "results": result.get("results", {}),
                 }

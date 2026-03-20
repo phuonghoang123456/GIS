@@ -11,7 +11,13 @@ from apps.common.helpers import calculate_trend, fixed, to_float
 from apps.common.responses import fail, ok
 from apps.gee.services import check_status, fetch_data
 
-from .models import Location, NdviData, RainfallData, SoilMoistureData, TemperatureData, TvdiData
+from .geometry_analysis import (
+    ndvi_geometry_response,
+    rainfall_geometry_response,
+    temperature_geometry_response,
+    tvdi_geometry_response,
+)
+from .models import AdminBoundary, Location, NdviData, Province, RainfallData, SoilMoistureData, TemperatureData, TvdiData, Ward
 from .services import dashboard_timeseries, ndvi_classification, parse_iso_date, tvdi_classification
 
 
@@ -88,7 +94,9 @@ class LocationsView(APIView):
     permission_classes = []
 
     def get(self, request):
-        rows = list(Location.objects.values("id", "name", "province").order_by("name"))
+        rows = list(Location.objects.values("id", "name", "province", "geometry").order_by("name"))
+        for row in rows:
+            row["has_geometry"] = bool(row.get("geometry"))
         return ok(rows)
 
 
@@ -100,6 +108,118 @@ class LocationDetailView(APIView):
         if not location:
             return fail("Location not found", 404, "not_found")
         return ok(location)
+
+
+class AdminBoundariesView(APIView):
+    permission_classes = []
+
+    def get(self, request):
+        level_raw = request.query_params.get("level")
+        include_geometry = request.query_params.get("include_geometry", "false").lower() == "true"
+        parent_code = request.query_params.get("parent_code")
+        province_name = request.query_params.get("province")
+
+        try:
+            level = _parse_int_param(level_raw, "level", minimum=1, maximum=3) if level_raw is not None else None
+            limit = _parse_int_param(request.query_params.get("limit", 500), "limit", minimum=1, maximum=5000)
+        except ValueError as exc:
+            return fail(str(exc), 400, "validation_error")
+
+        queryset = AdminBoundary.objects.all()
+        if level is not None:
+            queryset = queryset.filter(admin_level=level)
+        if parent_code:
+            queryset = queryset.filter(parent_code=parent_code)
+        if province_name:
+            queryset = queryset.filter(province_name__iexact=province_name)
+
+        fields = [
+            "id",
+            "boundary_code",
+            "name",
+            "normalized_name",
+            "admin_level",
+            "parent_code",
+            "province_name",
+            "location_id",
+            "centroid_lat",
+            "centroid_lng",
+            "source",
+            "effective_date",
+            "metadata",
+        ]
+        if include_geometry:
+            fields.append("geometry")
+
+        rows = list(queryset.order_by("name").values(*fields)[:limit])
+        for row in rows:
+            row["has_geometry"] = bool(row.get("geometry")) if include_geometry else None
+        return ok(rows)
+
+
+class AdminBoundaryDetailView(APIView):
+    permission_classes = []
+
+    def get(self, request, admin_level: int, boundary_code: str):
+        boundary = AdminBoundary.objects.filter(admin_level=admin_level, boundary_code=boundary_code).values().first()
+        if not boundary:
+            return fail("Boundary not found", 404, "not_found")
+        return ok(boundary)
+
+
+class StandardProvincesView(APIView):
+    permission_classes = []
+
+    def get(self, request):
+        rows = list(
+            Province.objects.select_related("administrative_unit")
+            .values(
+                "code",
+                "name",
+                "name_en",
+                "full_name",
+                "full_name_en",
+                "code_name",
+                "administrative_unit_id",
+                "administrative_unit__short_name",
+                "administrative_unit__short_name_en",
+            )
+            .order_by("code")
+        )
+        return ok(rows)
+
+
+class StandardWardsView(APIView):
+    permission_classes = []
+
+    def get(self, request):
+        province_code = request.query_params.get("province_code")
+        limit_raw = request.query_params.get("limit", 500)
+        try:
+            limit = _parse_int_param(limit_raw, "limit", minimum=1, maximum=5000)
+        except ValueError as exc:
+            return fail(str(exc), 400, "validation_error")
+
+        queryset = Ward.objects.select_related("administrative_unit")
+        if province_code:
+            queryset = queryset.filter(province_code=province_code)
+
+        rows = list(
+            queryset.values(
+                "code",
+                "name",
+                "name_en",
+                "full_name",
+                "full_name_en",
+                "code_name",
+                "province_code",
+                "administrative_unit_id",
+                "administrative_unit__short_name",
+                "administrative_unit__short_name_en",
+            )
+            .order_by("code")[:limit]
+        )
+        return ok(rows)
 
 
 class RainfallRangeView(APIView):
@@ -157,6 +277,9 @@ class RainfallRangeView(APIView):
                 },
             }
         )
+
+    def post(self, request):
+        return rainfall_geometry_response(request)
 
 
 class RainfallMonthlyView(APIView):
@@ -395,6 +518,9 @@ class TemperatureRangeView(APIView):
             }
         )
 
+    def post(self, request):
+        return temperature_geometry_response(request)
+
 
 class TemperatureMonthlyView(APIView):
     permission_classes = []
@@ -477,6 +603,144 @@ class TemperatureMonthlyView(APIView):
         return ok({"year": year, "monthly_data": payload})
 
 
+class SoilMoistureRangeView(APIView):
+    permission_classes = []
+
+    def get(self, request):
+        try:
+            location_id, start, end = _get_range_params(request)
+        except ValueError as exc:
+            return fail(str(exc), 400, "validation_error")
+
+        if _is_gee_source(request):
+            try:
+                rows = _fetch_gee_records(
+                    location_id=location_id,
+                    start=start,
+                    end=end,
+                    data_type="soil_moisture",
+                    province_query=request.query_params.get("province"),
+                )
+            except ValueError as exc:
+                return fail(str(exc), 400, "validation_error")
+            except RuntimeError as exc:
+                return fail(str(exc), 503, "gee_service_offline")
+            except RequestException as exc:
+                return fail("Failed to fetch data from GEE service", 502, "gee_service_error", {"message": str(exc)})
+
+            data = [
+                {
+                    "date": str(row.get("date", ""))[:10],
+                    "sm_surface": to_float(row.get("sm_surface")),
+                    "sm_rootzone": to_float(row.get("sm_rootzone")),
+                    "sm_profile": to_float(row.get("sm_profile")),
+                    "source": row.get("source"),
+                }
+                for row in rows
+            ]
+        else:
+            queryset = SoilMoistureData.objects.filter(location_id=location_id, date__range=[start, end]).order_by("date")
+            data = [
+                {
+                    "date": row.date,
+                    "sm_surface": to_float(row.sm_surface),
+                    "sm_rootzone": to_float(row.sm_rootzone),
+                    "sm_profile": to_float(row.sm_profile),
+                    "source": row.source,
+                }
+                for row in queryset
+            ]
+
+        avg_surface = sum(to_float(r["sm_surface"]) for r in data) / len(data) if data else 0
+        avg_rootzone = sum(to_float(r["sm_rootzone"]) for r in data) / len(data) if data else 0
+        avg_profile = sum(to_float(r["sm_profile"]) for r in data) / len(data) if data else 0
+
+        return ok(
+            {
+                "data": data,
+                "statistics": {
+                    "avg_surface": fixed(avg_surface, 4),
+                    "avg_rootzone": fixed(avg_rootzone, 4),
+                    "avg_profile": fixed(avg_profile, 4),
+                    "days": len(data),
+                },
+            }
+        )
+
+
+class SoilMoistureMonthlyView(APIView):
+    permission_classes = []
+
+    def get(self, request):
+        try:
+            location_id = _parse_int_param(request.query_params.get("location_id"), "location_id", minimum=1)
+            year = _parse_int_param(request.query_params.get("year"), "year", minimum=1900, maximum=2100)
+        except ValueError as exc:
+            return fail(str(exc), 400, "validation_error")
+
+        if _is_gee_source(request):
+            try:
+                rows = _fetch_gee_records(
+                    location_id=location_id,
+                    start=date(year, 1, 1),
+                    end=date(year, 12, 31),
+                    data_type="soil_moisture",
+                    province_query=request.query_params.get("province"),
+                )
+            except ValueError as exc:
+                return fail(str(exc), 400, "validation_error")
+            except RuntimeError as exc:
+                return fail(str(exc), 503, "gee_service_offline")
+            except RequestException as exc:
+                return fail("Failed to fetch data from GEE service", 502, "gee_service_error", {"message": str(exc)})
+
+            grouped = {}
+            for row in rows:
+                try:
+                    row_date = parse_iso_date(str(row.get("date", ""))[:10], "date")
+                except ValueError:
+                    continue
+                month = row_date.month
+                grouped.setdefault(month, {"sm_surface": [], "sm_rootzone": [], "sm_profile": []})
+                grouped[month]["sm_surface"].append(to_float(row.get("sm_surface")))
+                grouped[month]["sm_rootzone"].append(to_float(row.get("sm_rootzone")))
+                grouped[month]["sm_profile"].append(to_float(row.get("sm_profile")))
+
+            payload = []
+            for month, values in sorted(grouped.items()):
+                payload.append(
+                    {
+                        "month": month,
+                        "avg_surface": fixed(sum(values["sm_surface"]) / len(values["sm_surface"]) if values["sm_surface"] else 0, 4),
+                        "avg_rootzone": fixed(sum(values["sm_rootzone"]) / len(values["sm_rootzone"]) if values["sm_rootzone"] else 0, 4),
+                        "avg_profile": fixed(sum(values["sm_profile"]) / len(values["sm_profile"]) if values["sm_profile"] else 0, 4),
+                    }
+                )
+        else:
+            rows = (
+                SoilMoistureData.objects.filter(location_id=location_id, date__year=year)
+                .annotate(month=ExtractMonth("date"))
+                .values("month")
+                .annotate(
+                    avg_surface=Avg("sm_surface"),
+                    avg_rootzone=Avg("sm_rootzone"),
+                    avg_profile=Avg("sm_profile"),
+                )
+                .order_by("month")
+            )
+            payload = [
+                {
+                    "month": int(row["month"]),
+                    "avg_surface": fixed(row["avg_surface"], 4),
+                    "avg_rootzone": fixed(row["avg_rootzone"], 4),
+                    "avg_profile": fixed(row["avg_profile"], 4),
+                }
+                for row in rows
+            ]
+
+        return ok({"year": year, "monthly_data": payload})
+
+
 class NdviRangeView(APIView):
     permission_classes = []
 
@@ -546,6 +810,9 @@ class NdviRangeView(APIView):
                 },
             }
         )
+
+    def post(self, request):
+        return ndvi_geometry_response(request)
 
 
 class NdviMonthlyView(APIView):
@@ -734,6 +1001,9 @@ class TvdiRangeView(APIView):
                 },
             }
         )
+
+    def post(self, request):
+        return tvdi_geometry_response(request)
 
 
 class TvdiMonthlyView(APIView):
