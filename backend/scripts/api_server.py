@@ -11,6 +11,8 @@ import json
 from datetime import datetime
 import threading
 import os
+import re
+import unicodedata
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -35,10 +37,10 @@ def _initialize_gee_legacy():
         # Ép buộc dùng đúng project
         gee_project = os.getenv('GEE_PROJECT', 'healthy-sign-476116-g0')
         ee.Initialize(project=gee_project)
-        print(f"✅ GEE initialized with project {gee_project}")
+        print(f"GEE initialized with project {gee_project}")
         return True
     except Exception as e:
-        print(f"❌ GEE Initialize Error: {e}")
+        print(f"GEE initialize error: {e}")
         return False
 
 GEE_STATE = {
@@ -91,6 +93,78 @@ PROVINCE_MAPPING = {
     'Hồ Chí Minh': 'Ho Chi Minh city',
     # Thêm các tỉnh khác nếu cần
 }
+
+PROVINCE_MAPPING = {
+    "Quảng Trị": "Quang Tri",
+    "Quang Tri": "Quang Tri",
+    "Thừa Thiên Huế": "Thua Thien - Hue",
+    "Đà Nẵng": "Da Nang City",
+    "Da Nang": "Da Nang City",
+    "Quảng Nam": "Quang Nam",
+    "Quảng Ngãi": "Quang Ngai",
+    "Bình Định": "Binh Dinh",
+    "Hà Nội": "Ha Noi City",
+    "Hồ Chí Minh": "Ho Chi Minh City",
+    "TP. Hồ Chí Minh": "Ho Chi Minh City",
+    "Thành phố Hồ Chí Minh": "Ho Chi Minh City",
+    "Cần Thơ": "Can Tho city",
+    "Hải Phòng": "Hai Phong City",
+}
+
+
+PROVINCE_ALIASES = {
+    "da nang": {"da nang city"},
+    "ha noi": {"ha noi city"},
+    "ho chi minh": {"ho chi minh city", "thanh pho ho chi minh"},
+    "can tho": {"can tho city"},
+    "hai phong": {"hai phong city"},
+    "thua thien hue": {"thua thien hue", "thua thien-hue", "thua thien - hue"},
+    "ba ria vung tau": {"ba ria-vung tau"},
+}
+
+ADMIN_NAME_TOKENS = {"city", "province", "tinh", "thanh", "pho", "tp"}
+
+
+def normalize_province_key(value):
+    text = unicodedata.normalize("NFD", str(value or ""))
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def simplify_province_key(value):
+    tokens = [token for token in normalize_province_key(value).split() if token not in ADMIN_NAME_TOKENS]
+    return " ".join(tokens).strip()
+
+
+def build_province_lookup_keys(value):
+    normalized = normalize_province_key(value)
+    simplified = simplify_province_key(value)
+    keys = {key for key in {normalized, simplified} if key}
+
+    for key in list(keys):
+        keys.update(PROVINCE_ALIASES.get(key, set()))
+
+    expanded = set(keys)
+    for key in list(keys):
+        expanded.add(normalize_province_key(key))
+        expanded.add(simplify_province_key(key))
+
+    return {key for key in expanded if key}
+
+
+def resolve_province_name(province_name, available_names):
+    requested_keys = build_province_lookup_keys(province_name)
+    if not requested_keys:
+        return None
+
+    for available_name in available_names:
+        available_keys = build_province_lookup_keys(available_name)
+        if requested_keys.intersection(available_keys):
+            return available_name
+
+    return None
 
 
 def geometry_payload_to_ee_geometry(geometry_payload):
@@ -146,6 +220,49 @@ def get_region_geometry(province_name):
     except Exception as e:
         print(f"Error: {e}")
         return None
+
+def get_region_geometry(province_name):
+    try:
+        gaul_name = PROVINCE_MAPPING.get(province_name, province_name)
+        print(f"Searching for province: {province_name} -> {gaul_name}")
+
+        gadm = ee.FeatureCollection("FAO/GAUL/2015/level1")
+        vietnam = gadm.filter(ee.Filter.eq("ADM0_NAME", "Viet Nam"))
+
+        region = vietnam.filter(ee.Filter.eq("ADM1_NAME", gaul_name))
+        count = region.size().getInfo()
+        matched_name = gaul_name
+
+        if count == 0:
+            region = vietnam.filter(ee.Filter.eq("ADM1_NAME", province_name))
+            count = region.size().getInfo()
+            if count > 0:
+                matched_name = province_name
+
+        all_names = None
+        if count == 0:
+            all_names = vietnam.aggregate_array("ADM1_NAME").getInfo()
+            resolved_name = resolve_province_name(province_name, all_names)
+            if resolved_name:
+                region = vietnam.filter(ee.Filter.eq("ADM1_NAME", resolved_name))
+                count = region.size().getInfo()
+                matched_name = resolved_name
+                print(f"Fallback matched province: {province_name} -> {resolved_name}")
+
+        if count == 0:
+            if all_names is None:
+                all_names = vietnam.aggregate_array("ADM1_NAME").getInfo()
+            print("Province not found. Available provinces in Vietnam:")
+            for name in sorted(all_names):
+                print(f"   - {name}")
+            return None
+
+        print(f"Found province: {matched_name}")
+        return region.geometry()
+    except Exception as e:
+        print(f"Error: {e}")
+        return None
+
 
 # RAINFALL
 def get_rainfall_data(geometry, start_date, end_date, location_id):
@@ -1136,7 +1253,7 @@ def status():
 
 if __name__ == '__main__':
     print("=" * 70)
-    print("     🌍 Data Fetcher API Server")
+    print("     Data Fetcher API Server")
     print("=" * 70)
     print("  Running on: http://localhost:3001")
     print("  UI: Open data_fetcher.html in browser")
