@@ -1,6 +1,15 @@
-from django.urls import path
+﻿from django.urls import path
 
 from .analysis_areas import AnalysisAreaHistoryView
+from .map_views import (
+    MapContextView,
+    MapGeocodeView,
+    MapHotspotsView,
+    MapLayerView,
+    MapPointSampleView,
+    MapReverseGeocodeView,
+    MapRouteView,
+)
 from .views import (
     AdminBoundariesView,
     AdminBoundaryDetailView,
@@ -8,9 +17,14 @@ from .views import (
     DashboardTimeseriesView,
     LocationDetailView,
     LocationsView,
+    ManualEntryDetailView,
+    ManualEntryView,
+    MonitoringStationDetailView,
+    MonitoringStationsView,
     NdviMonthlyView,
     NdviRangeView,
     NdviYearlyView,
+    RainfallCalculationView,
     RainfallCompareLocationsView,
     RainfallComparePeriodsView,
     RainfallMonthlyView,
@@ -30,6 +44,11 @@ from .views import (
 
 
 urlpatterns = [
+    path("climate/stations", MonitoringStationsView.as_view()),
+    path("climate/stations/<int:station_id>", MonitoringStationDetailView.as_view()),
+    path("climate/rainfall/calculate", RainfallCalculationView.as_view()),
+    path("climate/manual-entry", ManualEntryView.as_view()),
+    path("climate/manual-entry/<str:data_type>/<int:record_id>", ManualEntryDetailView.as_view()),
     path("analysis-areas/history", AnalysisAreaHistoryView.as_view()),
     path("boundaries", AdminBoundariesView.as_view()),
     path("boundaries/<int:admin_level>/<str:boundary_code>", AdminBoundaryDetailView.as_view()),
@@ -37,6 +56,13 @@ urlpatterns = [
     path("standard/wards", StandardWardsView.as_view()),
     path("locations", LocationsView.as_view()),
     path("locations/<int:location_id>", LocationDetailView.as_view()),
+    path("map/geocode", MapGeocodeView.as_view()),
+    path("map/reverse", MapReverseGeocodeView.as_view()),
+    path("map/context", MapContextView.as_view()),
+    path("map/route", MapRouteView.as_view()),
+    path("map/layer", MapLayerView.as_view()),
+    path("map/point-sample", MapPointSampleView.as_view()),
+    path("map/hotspots", MapHotspotsView.as_view()),
     path("rainfall", RainfallRangeView.as_view()),
     path("rainfall/monthly", RainfallMonthlyView.as_view()),
     path("rainfall/yearly", RainfallYearlyView.as_view()),
